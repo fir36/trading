@@ -21,8 +21,9 @@ from strategy import MYT, replay
 MARKETS = {
     "XAUUSD": dict(yahoo="GC=F", spread=0.30, contract=100, digits=2, tp_off=1.0,
                    note="gold FUTURES price, usually a few $ above your broker's spot price"),
-    "USOIL": dict(yahoo="CL=F", spread=0.04, contract=1000, digits=2,
-                  note="WTI FUTURES price, may differ a little from your broker's oil price"),
+    # WTI is off: it lost -1.2R over 4 trades in the Aug-Oct 2026 replay. Uncomment to test it again.
+    # "USOIL": dict(yahoo="CL=F", spread=0.04, contract=1000, digits=2,
+    #               note="WTI FUTURES price, may differ a little from your broker's oil price"),
     "EURUSD": dict(yahoo="EURUSD=X", spread=0.00012, contract=100000, digits=5),
     "USDJPY": dict(yahoo="JPY=X", spread=0.015, contract=100000, digits=3, quote_is_jpy=True),
 }
@@ -112,13 +113,7 @@ def main():
                 text = f"{sym} {head}\n{ev.text}\n{sizes}" + (f"\nNote: {mk['note']}" if mk.get("note") else "")
             msgs.append(text)
             sent.add(eid)
-        if st is None:
-            status.append(f"{sym}: no setup")
-        elif not st.open_orders():
-            status.append(f"{sym}: pending {'BUY' if st.dir == 1 else 'SELL'} setup, order 1 at {st.px[0]:.{mk['digits']}f}, SL {st.sl:.{mk['digits']}f}")
-        else:
-            status.append(f"{sym}: IN TRADE ({'BUY' if st.dir == 1 else 'SELL'}), orders open {[k + 1 for k in st.open_orders()]}, "
-                          f"SL {st.sl:.{mk['digits']}f}, TP1 {st.tp1:.{mk['digits']}f}")
+        status.append(status_text(sym, mk, st))
 
     if replay_only:
         print_replay(all_trades)
@@ -129,12 +124,35 @@ def main():
     myt = now.tz_convert(MYT)
     today = myt.strftime("%Y-%m-%d")
     if os.environ.get("SUMMARY") == "true" or (myt.hour >= 7 and myt.weekday() < 5 and state.get("daily") != today):
-        msgs.append("Daily check (bot is running)\n" + "\n".join(status) + f"\nBalance setting ${balance:.0f}, risk {risk_pct:.0f}%")
+        msgs.append("Daily check (bot is running)\n\n" + "\n\n".join(status) + f"\n\nBalance setting ${balance:.0f}, risk {risk_pct:.0f}%")
         state["daily"] = today
     if msgs:
         send("\n\n".join(msgs))
     state["sent"] = sorted(sent)[-500:]
     STATE.write_text(json.dumps(state, indent=1) + "\n")
+
+
+def status_text(sym, mk, st):
+    """Daily check block: every order with its state, entry, SL and TP, so you can compare with MT5."""
+    if st is None:
+        return f"{sym}: no setup, no orders"
+    f = lambda x: f"{x:.{mk['digits']}f}"
+    side = "BUY" if st.dir == 1 else "SELL"
+    head = "IN TRADE" if st.open_orders() else "PENDING SETUP"
+    lines = [f"{sym}: {head} ({side}), zone {f(min(st.e1, st.zo))} - {f(max(st.e1, st.zo))}"]
+    for k in range(3):
+        if st.closed[k]:
+            state = "closed"
+        elif st.filled[k] is not None:
+            state = "filled"
+        elif st.rest_cancelled:
+            state = "cancelled"
+        else:
+            state = "pending"
+        sl = st.px[2] if (k == 2 and st.tp1_done) else st.sl
+        tp = st.tp2 if k == 2 else st.tp1
+        lines.append(f"{k + 1}) {side} LIMIT {f(st.px[k])} [{state}] SL {f(sl)} TP {f(tp)}" + (" (runner)" if k == 2 else ""))
+    return "\n".join(lines)
 
 
 def print_replay(trades):

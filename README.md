@@ -11,7 +11,7 @@ the trades can be placed by hand in MT5 (e.g. on Android). The bot never connect
 | `.github/workflows/alerts.yml` | Runs the bot every 15 minutes on GitHub Actions. |
 | `mt5-mcp/` | MCP server + Python backtest for MT5 (needs MT5 on Windows). |
 
-Markets: XAUUSD, USOIL (WTI), EURUSD, USDJPY.
+Markets: XAUUSD, EURUSD, USDJPY. WTI (USOIL) is switched off in `alerts/run.py` after a losing replay.
 
 ## Setup (from a phone or any browser)
 
@@ -45,20 +45,21 @@ Anyone with the token can send messages as your bot: if it leaks, revoke it in @
 
 ## Limits - read before trading real money
 
-- **Data:** free Yahoo prices, not your broker's. Gold and WTI are **futures** prices: gold is usually a few
+- **Data:** free Yahoo prices, not your broker's. Gold is a **futures** price: usually a few
   dollars above spot, so shift every level by (your MT5 price - "data price at setup"). Forex is close.
 - **Timing:** GitHub's schedule can start runs several minutes late (sometimes more), so alerts are not instant.
 - **Same rules as the backtest, two changes for manual trading:** levels are frozen when a setup is found
   (with a steadier 24h ATR for the SL buffer) and pending orders are not removed around news.
 - **Alert volume:** about 4-7 alerts per market per week in the last 2 months, many of them "setup moved", some at night.
-- **Replay on Yahoo data (Aug 31 - Oct 31 2026, 4 markets):** 17 trades, +11.6R; at 20% risk $100 -> $522 but
-  with a **57% worst drop**. WTI lost (-1.2R over 4 trades). A few weeks of data is not proof: start on a demo account.
-- **$100 accounts:** the 0.01 minimum lot on gold/WTI can risk more than 20%; the alert warns when that happens.
+- **Replay on Yahoo data (Aug 31 - Oct 31 2026, gold + EURUSD + USDJPY):** 13 trades, +12.8R; at 20% risk
+  $100 -> $693 with a **35% worst drop** (10% risk: $300, 18% drop). WTI lost -1.2R over 4 trades, so it is off.
+  Two months of data is not proof: start on a demo account.
+- **$100 accounts:** the 0.01 minimum lot on gold can risk more than 20%; the alert warns when that happens.
 
 ## Run locally
 
 ```
 pip install -r alerts/requirements.txt
 python alerts/run.py --replay   # backtest the last ~60 days, prints trades and $100 results
-python alerts/run.py            # one normal run; prints the messages if WA_PHONE/WA_APIKEY are not set
+python alerts/run.py            # one normal run; prints the messages if no Telegram/WhatsApp secrets are set
 ```
