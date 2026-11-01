@@ -1,0 +1,46 @@
+# Runs the SMC v6 alert bot every 15 minutes and sends new events to WhatsApp (CallMeBot).
+name: smc-alerts
+
+on:
+  schedule:
+    - cron: "*/15 * * * 0-5"   # UTC, Sun-Fri (markets open Mon 06:00 MYT = Sun 22:00 UTC); GitHub may start runs late
+  workflow_dispatch:            # "Run workflow" button: also sends a status summary
+    inputs:
+      summary:
+        description: "Send a status summary"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write               # only to commit alerts/state.json (which alerts were already sent)
+
+concurrency:
+  group: smc-alerts             # never two runs at once (they would send the same alert twice)
+  cancel-in-progress: false
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: alerts/requirements.txt
+      - run: pip install -r alerts/requirements.txt
+      - name: Run strategy and send alerts
+        run: python alerts/run.py
+        env:
+          WA_PHONE: ${{ secrets.WA_PHONE }}           # your WhatsApp number, international format (+60...)
+          WA_APIKEY: ${{ secrets.WA_APIKEY }}         # key from CallMeBot
+          ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }} # for lot sizes (default 100)
+          RISK_PCT: ${{ vars.RISK_PCT }}               # % of balance per trade (default 20)
+          SUMMARY: ${{ inputs.summary }}
+      - name: Save sent-alert state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add alerts/state.json
+          git diff --cached --quiet || { git commit -m "alerts: update state" && git push; }

@@ -1,0 +1,63 @@
+# Strategy rules enforced by the MCP server. Edit here; re-read on every tool call.
+# Top-down structure: W1/D1/H4 bias -> H4/H1 zone -> M15/M5 confirmation.
+
+symbol: XAUUSD            # broker may use XAUUSDm, GOLD, etc.
+magic: 26102901           # tags positions opened by this server
+
+bias:
+  timeframes: [W1, D1, H4]   # ALL must be bearish -> sell-only, ALL bullish -> buy-only, else no trade
+
+swing:                       # bars on each side of a pivot high/low
+  W1: 2
+  D1: 3
+  H4: 3
+  H1: 3
+  M15: 2
+  M5: 2
+
+zones:
+  timeframes: [H4, H1]
+  max_per_tf: 4              # nearest N unbroken zones per timeframe
+  min_thickness_atr: 0.3     # zone = swing candle high down to its body top, clamped to this ATR range
+  max_thickness_atr: 1.5
+  min_confluence: 1          # 2 = zone must overlap on both H4 and H1
+
+entry:
+  confirm_timeframes: [M15, M5]   # tried in order
+  touch_lookback_hours: 3         # price must have entered the zone within this window
+  signal_max_age_bars: 2          # CHoCH / engulfing must be this fresh
+  min_confirmations: 1            # price-in-zone is mandatory, plus this many of: CHoCH, engulfing (max 2)
+
+stop:
+  mode: peak                 # peak = beyond highest high since zone touch; zone = beyond the zone edge
+  atr_timeframe: M15
+  atr_period: 14
+  buffer_atr: 0.25           # SL = highest high since zone touch + this buffer
+  min_atr: 1.0               # stop never closer than this (noise)
+  max_atr: 4.0               # wider than this -> skip the trade
+
+target:
+  mode: h1_swing             # h1_swing = nearest H1 swing; next_zone = next opposite H4/H1 zone minus offset
+  offset: 0.0                # next_zone only: stop the TP this far (price) before the zone
+  min_rr: 2.0                # target = nearest H1 swing low (sell) / high (buy); skip if reward < min_rr x risk
+  partial_at_r: 1.0          # manage_positions: close part at +1R and move SL to break-even
+  partial_fraction: 0.5
+
+risk:
+  per_trade_pct: 1.0         # hard-capped at 2.0 in code
+  max_open_positions: 1
+  max_trades_24h: 2
+  max_spread_points: 60      # in symbol points (XAUUSD 2-digit: 60 = $0.60)
+
+sessions_myt: ["21:00-01:00"]    # London/New York overlap. Adjust after the US clock change (Nov 1).
+friday_cutoff_myt: "22:00"       # no new trades Friday after this time (MYT); weekends blocked
+
+news:
+  blackout_minutes_before: 30
+  blackout_minutes_after: 30
+  events_myt: []             # add today's high-impact events, e.g. "2026-11-06 21:30" (no live calendar here)
+
+execution:
+  dry_run: true              # true = never sends orders, only reports what it would do
+  allow_live: false          # false = refuse to trade on a real (non-demo) account
+  deviation_points: 30

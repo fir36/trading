@@ -1,0 +1,354 @@
+//@version=6
+// v5 of the swing scale-in strategy (smc_strategy_sd.pine "Scale-in x3"). Run on M15. Changes from v4, from the diagnostics:
+// 1. Zone pick: look at the 3 nearest fresh zones on H4 and on H1 and trade the nearest one that passes the stop and RR checks
+//    (v4 only looked at the single nearest zone and skipped the trade when that one was too wide).
+// 2. Reward to the next opposite zone must be at least minRR (now 2.0).
+// 3. Time stop: if TP1 is not reached within timeStopH hours, close everything.
+// v6 adds the broker spread: orders that fill on the ask side are shifted by the spread, the spread cost is deducted
+// in the logs (net result), the stop sits >= 2 x spread beyond the zone, the TP offset is >= 1 x spread, and setups
+// where the spread is more than maxSprPct of the stop distance are skipped. Logs: every trade's context and outcome.
+strategy("SMC v6 (spread)", overlay = true, initial_capital = 10000, pyramiding = 3,
+     process_orders_on_close = true, default_qty_type = strategy.fixed,
+     margin_long = 0, margin_short = 0, max_bars_back = 500)
+
+riskPct   = input.float(1.0, "Risk per trade %", maxval = 20.0)
+tp1R      = input.float(1.5, "TP1 at this R from the average entry")
+minRR     = input.float(2.0, "Min reward:risk to the next opposite zone")
+timeStopH = input.float(12, "Time stop: close if TP1 not hit within N hours (0 = off)")
+swD1      = input.int(3, "Swing D1 (bias)")
+basePct   = input.float(0.5, "Base candle: body at most this x its range")
+maxBase   = input.int(3, "Max base candles")
+legATR    = input.float(1.0, "Leg-out candle: body at least this x ATR")
+slBufATR  = input.float(0.5, "SL buffer beyond zone (ATR M15)")
+tpOffIn   = input.float(1.0, "TP offset before next zone (gold: price; other symbols use 0.12 x ATR M15)")
+maxSprPct = input.float(10.0, "Skip setup if spread > this % of the stop distance")
+maxATR    = input.float(4.0, "SL max (ATR M15), wider = skip that zone")
+maxPer24h = input.int(99, "Max entries per rolling 24h (99 = no limit, chosen after the B/C test)")
+// where the 3 orders sit (each risks 1/3); E3 is always the runner
+entrySplit = input.string("1 edge + 2 mid", "Entry split", options = ["1 edge + 2 mid", "2 edge + 1 mid", "3 at edge", "3 at mid"])
+breakFrom = input.int(500, "No trading from HHMM (MYT)")
+breakTo   = input.int(700, "No trading until HHMM (MYT)")
+fridayCut = input.int(2200, "Friday cutoff HHMM (MYT)")
+newsTimes = input.string("2030,2200,0200", "News times HHMM MYT")
+newsMin   = input.int(30, "No trading +/- minutes around news")
+tz = "Asia/Kuala_Lumpur"
+
+f_struct(int n) =>
+    var float hPrev = na
+    var float hLast = na
+    var float lPrev = na
+    var float lLast = na
+    ph = ta.pivothigh(high, n, n)
+    pl = ta.pivotlow(low, n, n)
+    if not na(ph)
+        hPrev := hLast
+        hLast := ph
+    if not na(pl)
+        lPrev := lLast
+        lLast := pl
+    hLast < hPrev and lLast < lPrev ? -1 : hLast > hPrev and lLast > lPrev ? 1 : 0
+
+// base zones on the security timeframe; returns the 3 nearest fresh supply zones above close (s1 nearest),
+// the 3 nearest fresh demand zones below close (d1 nearest), and the nearest unbroken opposite edges (targets)
+f_zones(float bPct, int mBase, float lATR) =>
+    var supHi = array.new<float>()
+    var supLo = array.new<float>()
+    var supT  = array.new<int>()
+    var demHi = array.new<float>()
+    var demLo = array.new<float>()
+    var demT  = array.new<int>()
+    a = ta.atr(14)
+    if supHi.size() > 0
+        for i = supHi.size() - 1 to 0
+            if close > supHi.get(i)
+                supHi.remove(i)
+                supLo.remove(i)
+                supT.remove(i)
+            else if supT.get(i) == -1 and high >= supLo.get(i)
+                supT.set(i, bar_index)
+    if demLo.size() > 0
+        for i = demLo.size() - 1 to 0
+            if close < demLo.get(i)
+                demHi.remove(i)
+                demLo.remove(i)
+                demT.remove(i)
+            else if demT.get(i) == -1 and low <= demHi.get(i)
+                demT.set(i, bar_index)
+    if math.abs(close - open) >= lATR * a
+        int k = 0
+        float bh = na
+        float bl = na
+        for i = 1 to mBase
+            r = high[i] - low[i]
+            if r > 0 and math.abs(close[i] - open[i]) <= bPct * r
+                k += 1
+                bh := na(bh) ? high[i] : math.max(bh, high[i])
+                bl := na(bl) ? low[i] : math.min(bl, low[i])
+            else
+                break
+        legIn = k > 0 and math.abs(close[k + 1] - open[k + 1]) > bPct * (high[k + 1] - low[k + 1])
+        if legIn and close < open and close < bl
+            supHi.push(bh)
+            supLo.push(bl)
+            supT.push(-1)
+        if legIn and close > open and close > bh
+            demHi.push(bh)
+            demLo.push(bl)
+            demT.push(-1)
+    while supHi.size() > 60
+        supHi.shift()
+        supLo.shift()
+        supT.shift()
+    while demLo.size() > 60
+        demHi.shift()
+        demLo.shift()
+        demT.shift()
+    // nearest three fresh supply (ascending low) and demand (descending high)
+    float s1L = na
+    float s1H = na
+    float s2L = na
+    float s2H = na
+    float s3L = na
+    float s3H = na
+    float d1L = na
+    float d1H = na
+    float d2L = na
+    float d2H = na
+    float d3L = na
+    float d3H = na
+    float tgtS = na
+    float tgtD = na
+    for pass = 1 to 3
+        float bestL = na
+        float bestH = na
+        float floorL = pass == 1 ? -1e10 : pass == 2 ? s1L : s2L
+        if supHi.size() > 0 and not na(floorL)
+            for i = 0 to supHi.size() - 1
+                lo = supLo.get(i)
+                t = supT.get(i)
+                if supHi.get(i) > close and (t == -1 or bar_index - t <= 1) and lo > floorL and (na(bestL) or lo < bestL)
+                    bestL := lo
+                    bestH := supHi.get(i)
+        if pass == 1
+            s1L := bestL
+            s1H := bestH
+        else if pass == 2
+            s2L := bestL
+            s2H := bestH
+        else
+            s3L := bestL
+            s3H := bestH
+    for pass = 1 to 3
+        float bestL = na
+        float bestH = na
+        float ceilH = pass == 1 ? 1e10 : pass == 2 ? d1H : d2H
+        if demLo.size() > 0 and not na(ceilH)
+            for i = 0 to demLo.size() - 1
+                hi = demHi.get(i)
+                t = demT.get(i)
+                if demLo.get(i) < close and (t == -1 or bar_index - t <= 1) and hi < ceilH and (na(bestH) or hi > bestH)
+                    bestL := demLo.get(i)
+                    bestH := hi
+        if pass == 1
+            d1L := bestL
+            d1H := bestH
+        else if pass == 2
+            d2L := bestL
+            d2H := bestH
+        else
+            d3L := bestL
+            d3H := bestH
+    if supHi.size() > 0
+        for i = 0 to supHi.size() - 1
+            lo = supLo.get(i)
+            if lo > close and (na(tgtS) or lo < tgtS)
+                tgtS := lo
+    if demLo.size() > 0
+        for i = 0 to demLo.size() - 1
+            hi = demHi.get(i)
+            if hi < close and (na(tgtD) or hi > tgtD)
+                tgtD := hi
+    [s1L, s1H, s2L, s2H, s3L, s3H, d1L, d1H, d2L, d2H, d3L, d3H, tgtS, tgtD]
+
+stD = request.security(syminfo.tickerid, "D", f_struct(swD1), lookahead = barmerge.lookahead_off)
+[a1L, a1H, a2L, a2H, a3L, a3H, ad1L, ad1H, ad2L, ad2H, ad3L, ad3H, aTS, aTD] = request.security(syminfo.tickerid, "240", f_zones(basePct, maxBase, legATR), lookahead = barmerge.lookahead_off)
+[b1L, b1H, b2L, b2H, b3L, b3H, bd1L, bd1H, bd2L, bd2H, bd3L, bd3H, bTS, bTD] = request.security(syminfo.tickerid, "60",  f_zones(basePct, maxBase, legATR), lookahead = barmerge.lookahead_off)
+a15  = request.security(syminfo.tickerid, "15", ta.atr(14), lookahead = barmerge.lookahead_off)
+bias = stD
+stH4 = request.security(syminfo.tickerid, "240", f_struct(3), lookahead = barmerge.lookahead_off)
+stH1 = request.security(syminfo.tickerid, "60", f_struct(3), lookahead = barmerge.lookahead_off)
+// typical standard-account spread per symbol (price units); chart prices are treated as the bid
+tk  = syminfo.ticker
+spr = tk == "XAUUSD" ? 0.30 : tk == "XAGUSD" ? 0.03 : tk == "EURUSD" ? 0.00012 : tk == "GBPUSD" ? 0.00018 : tk == "USDJPY" ? 0.015 : tk == "BTCUSD" ? 30.0 :
+      tk == "AUDUSD" ? 0.00014 : tk == "NZDUSD" ? 0.00018 : tk == "USDCAD" ? 0.00018 : tk == "USDCHF" ? 0.00016 : tk == "USOIL" ? 0.04 : 0.0
+tpOff = math.max(tk == "XAUUSD" ? tpOffIn : 0.12 * a15, spr)     // $1 on gold is ~0.12 ATR; never less than the spread
+buf   = math.max(slBufATR * a15, 2 * spr)                          // stop at least 2 x spread beyond the zone
+tgtS = na(aTS) ? bTS : na(bTS) ? aTS : math.min(aTS, bTS)
+tgtD = na(aTD) ? bTD : na(bTD) ? aTD : math.max(aTD, bTD)
+
+// ---------- pick the nearest zone that passes the checks ----------
+// sell: candidate supply zones, nearest = lowest low; buy: candidate demand zones, nearest = highest high
+supLs = array.from(a1L, a2L, a3L, b1L, b2L, b3L)
+supHs = array.from(a1H, a2H, a3H, b1H, b2H, b3H)
+demLs = array.from(ad1L, ad2L, ad3L, bd1L, bd2L, bd3L)
+demHs = array.from(ad1H, ad2H, ad3H, bd1H, bd2H, bd3H)
+float sL = na
+float sH = na
+float dL = na
+float dH = na
+int nChecked = 0
+int nWide = 0
+int nLowRR = 0
+for i = 0 to 5
+    lo = supLs.get(i)
+    hi = supHs.get(i)
+    if not na(lo) and close < lo
+        nChecked += 1
+        dist = hi + buf - lo
+        rr = na(tgtD) ? 0.0 : (lo - (tgtD + tpOff)) / dist
+        if dist > maxATR * a15 or spr > maxSprPct / 100 * dist
+            nWide += 1
+        else if rr < minRR
+            nLowRR += 1
+        else if na(sL) or lo < sL
+            sL := lo
+            sH := hi
+    lo2 = demLs.get(i)
+    hi2 = demHs.get(i)
+    if not na(hi2) and close > hi2
+        dist2 = hi2 - (lo2 - buf)
+        rr2 = na(tgtS) ? 0.0 : ((tgtS - tpOff) - hi2) / dist2
+        if dist2 <= maxATR * a15 and spr <= maxSprPct / 100 * dist2 and rr2 >= minRR and (na(dH) or hi2 > dH)
+            dL := lo2
+            dH := hi2
+
+// ---------- time rules ----------
+hhmm    = hour(time_close, tz) * 100 + minute(time_close, tz)
+mins    = hour(time_close, tz) * 60 + minute(time_close, tz)
+dow     = dayofweek(time_close, tz)
+inBreak = breakFrom <= breakTo ? (hhmm >= breakFrom and hhmm < breakTo) : (hhmm >= breakFrom or hhmm < breakTo)
+var newsArr = str.split(newsTimes, ",")
+bool newsOk = true
+for s in newsArr
+    t = str.tonumber(str.trim(s))
+    if not na(t)
+        d = math.abs(mins - (math.floor(t / 100) * 60 + t % 100))
+        if math.min(d, 1440 - d) <= newsMin
+            newsOk := false
+timeOk = not inBreak and newsOk and dow != dayofweek.saturday and dow != dayofweek.sunday and not (dow == dayofweek.friday and hhmm >= fridayCut)
+
+var entryTimes = array.new<int>()
+if strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+    entryTimes.push(time_close)
+n24 = 0
+if entryTimes.size() > 0
+    for i = 0 to entryTimes.size() - 1
+        if time_close - entryTimes.get(i) < 86400000
+            n24 += 1
+flat = strategy.position_size == 0
+// H4 filter: no sells while H4 structure is bullish, no buys while it is bearish
+sellSig = timeOk and flat and n24 < maxPer24h and bias == -1 and not na(sL) and stH4 != 1
+buySig  = timeOk and flat and n24 < maxPer24h and bias == 1 and not na(dH) and stH4 != -1
+
+// ---------- scale-in x3 orders ----------
+// ask-side fills (sell exits, buy entries) are placed spr lower on the bid chart, so they trigger when the ask reaches the level
+var float scRun = na     // runner (E3) entry price: its break-even level after TP1
+var float scTP1 = na
+var float scTP2 = na
+var float scSL  = na
+var float scE1  = na
+var int   scDir = 0
+var bool  scTP1Done = false
+var int   barsIn = 0
+var string scInfo = ""
+askAdj(float px, int dir, bool isEntry) => (dir == -1 and not isEntry) or (dir == 1 and isEntry) ? px - spr : px
+if strategy.position_size != 0
+    barsIn += 1
+if flat
+    barsIn := 0
+    if sellSig or buySig
+        dir = sellSig ? -1 : 1
+        e1  = dir == -1 ? sL : dH
+        zo  = dir == -1 ? sH : dL
+        mid = (e1 + zo) / 2
+        sl  = dir == -1 ? sH + buf : dL - buf
+        // order prices for the chosen split: E1, E2, E3 (runner)
+        p1  = entrySplit == "3 at mid" ? mid : e1
+        p2  = entrySplit == "1 edge + 2 mid" or entrySplit == "3 at mid" ? mid : e1
+        p3  = entrySplit == "3 at edge" ? e1 : mid
+        tp1 = p1 + dir * tp1R * math.abs(sl - p1)
+        tpz = dir == -1 ? tgtD + tpOff : tgtS - tpOff
+        tp2 = dir == -1 ? math.min(tpz, tp1) : math.max(tpz, tp1)
+        r   = strategy.equity * riskPct / 100 / 3
+        q1  = math.floor(r / (math.abs(sl - p1) + spr) * 100) / 100
+        q2  = math.floor(r / (math.abs(sl - p2) + spr) * 100) / 100
+        q3  = math.floor(r / (math.abs(sl - p3) + spr) * 100) / 100
+        side = dir == -1 ? strategy.short : strategy.long
+        strategy.entry("E1", side, qty = q1, limit = askAdj(p1, dir, true))
+        strategy.entry("E2", side, qty = q2, limit = askAdj(p2, dir, true))
+        strategy.entry("E3", side, qty = q3, limit = askAdj(p3, dir, true))
+        strategy.exit("X1", "E1", limit = askAdj(tp1, dir, false), stop = askAdj(sl, dir, false))
+        strategy.exit("X2", "E2", limit = askAdj(tp1, dir, false), stop = askAdj(sl, dir, false))
+        strategy.exit("X3", "E3", limit = askAdj(tp2, dir, false), stop = askAdj(sl, dir, false))
+        scRun := p3, scTP1 := tp1, scTP2 := tp2, scSL := sl, scE1 := e1, scDir := dir, scTP1Done := false
+        scInfo := str.format("{0} {1} zone {2}-{3} (width {4} ATR) | stop {5} ATR | spread = {6}% of stop | RR to next zone {7} | D1={8} H4={9} H1={10}",
+             tk, dir == -1 ? "SELL" : "BUY", math.min(e1, zo), math.max(e1, zo), math.round(math.abs(e1 - zo) / a15, 1),
+             math.round(math.abs(sl - e1) / a15, 1), math.round(spr / math.abs(sl - e1) * 100, 1),
+             math.round(math.abs(tpz - e1) / math.abs(sl - e1), 2), bias, stH4, stH1)
+    else
+        strategy.cancel_all()
+else if not scTP1Done
+    hitTP1 = scDir == -1 ? low <= scTP1 - spr : high >= scTP1
+    if hitTP1
+        strategy.cancel("E2")
+        strategy.cancel("E3")
+        strategy.exit("X3", "E3", limit = askAdj(scTP2, scDir, false), stop = askAdj(scRun, scDir, false))
+        scTP1Done := true
+    else if timeStopH > 0 and barsIn >= timeStopH * 4
+        strategy.close_all(comment = "time stop")
+    else
+        avg = strategy.position_avg_price + (scDir == 1 ? spr : 0)     // real (ask) average for buys
+        scTP1 := avg + scDir * tp1R * math.abs(scSL - avg)
+        scTP2 := scDir == -1 ? math.min(scTP2, scTP1) : math.max(scTP2, scTP1)
+        strategy.exit("X1", "E1", limit = askAdj(scTP1, scDir, false), stop = askAdj(scSL, scDir, false))
+        strategy.exit("X2", "E2", limit = askAdj(scTP1, scDir, false), stop = askAdj(scSL, scDir, false))
+        strategy.exit("X3", "E3", limit = askAdj(scTP2, scDir, false), stop = askAdj(scSL, scDir, false))
+
+// ---------- logs: context at entry; at exit gross / spread / net result, best and worst move, how it ended ----------
+var float eqIn = na
+var float maxQty = 0.0
+var float mfe = 0.0
+var float mae = 0.0
+var int nTrades = 0
+var bool timeStopped = false
+if strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+    eqIn := strategy.equity
+    maxQty := 0.0
+    mfe := 0.0
+    mae := 0.0
+    timeStopped := false
+    nTrades += 1
+    log.info("ENTRY {0}", scInfo)
+if strategy.position_size != 0
+    maxQty := math.max(maxQty, math.abs(strategy.position_size))
+    risk = math.abs(scSL - scE1)
+    mfe := math.max(mfe, (scDir == -1 ? scE1 - low : high - scE1) / risk)
+    mae := math.max(mae, (scDir == -1 ? high - scE1 : scE1 - low) / risk)
+    if timeStopH > 0 and barsIn >= timeStopH * 4 and not scTP1Done
+        timeStopped := true
+if strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+    gross = (strategy.equity - eqIn) / eqIn * 100
+    cost  = spr * maxQty / eqIn * 100
+    how   = timeStopped ? "time stop" : scTP1Done ? "TP1 (+runner)" : gross > 0 ? "TP1" : "stop loss"
+    log.info("EXIT {0} | gross {1}% | spread {2}% | net {3}% | best move {4}R | worst {5}R | {6}h",
+         how, math.round(gross, 3), math.round(cost, 3), math.round(gross - cost, 3), math.round(mfe, 2), math.round(mae, 2), math.round(barsIn * 0.25, 1))
+var int nSkipWide = 0
+if timeOk and flat and bias != 0
+    nSkipWide += nWide
+if barstate.islastconfirmedhistory
+    log.info("SUMMARY {0} trades {1} | zone checks rejected (stop too wide or spread > {2}% of stop) {3}", tk, nTrades, maxSprPct, nSkipWide)
+
+plot(sH, "Supply high", color.new(color.red, 30), style = plot.style_linebr)
+plot(sL, "Supply low",  color.new(color.red, 30), style = plot.style_linebr)
+plot(dH, "Demand high", color.new(color.green, 30), style = plot.style_linebr)
+plot(dL, "Demand low",  color.new(color.green, 30), style = plot.style_linebr)

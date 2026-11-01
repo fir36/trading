@@ -1,0 +1,301 @@
+//@version=6
+// Diagnostic copy of the swing scale-in strategy (smc_strategy_sd.pine, "Scale-in x3", TP1 1.5R). Run on M15.
+// Same trading rules; adds Pine Logs that explain (1) how many bars pass each filter, (2) every candidate zone and
+// why it was / was not traded, (3) each trade's context and how far price went for / against it before closing.
+strategy("SMC gold v4 diag", overlay = true, initial_capital = 10000, pyramiding = 3,
+     process_orders_on_close = true, default_qty_type = strategy.fixed,
+     margin_long = 0, margin_short = 0, max_bars_back = 500)
+
+tp1R      = input.float(1.5, "TP1 at this R from the average entry")
+swD1      = input.int(3, "Swing D1 (bias)")
+basePct   = input.float(0.5, "Base candle: body at most this x its range")
+maxBase   = input.int(3, "Max base candles")
+legATR    = input.float(1.0, "Leg-out candle: body at least this x ATR")
+slBufATR  = input.float(0.5, "SL buffer beyond zone (ATR M15)")
+tpOff     = input.float(1.0, "TP offset before next zone (price)")
+maxATR    = input.float(4.0, "SL max (ATR M15), wider = skip")
+minRR     = input.float(1.5, "Min reward:risk")
+riskPct   = input.float(1.0, "Risk per trade %")
+maxPer24h = input.int(2, "Max entries per rolling 24h")
+breakFrom = input.int(500, "No trading from HHMM (MYT)")
+breakTo   = input.int(700, "No trading until HHMM (MYT)")
+fridayCut = input.int(2200, "Friday cutoff HHMM (MYT)")
+newsTimes = input.string("2030,2200,0200", "News times HHMM MYT")
+newsMin   = input.int(30, "No trading +/- minutes around news")
+tz = "Asia/Kuala_Lumpur"
+
+f_struct(int n) =>
+    var float hPrev = na
+    var float hLast = na
+    var float lPrev = na
+    var float lLast = na
+    ph = ta.pivothigh(high, n, n)
+    pl = ta.pivotlow(low, n, n)
+    if not na(ph)
+        hPrev := hLast
+        hLast := ph
+    if not na(pl)
+        lPrev := lLast
+        lLast := pl
+    hLast < hPrev and lLast < lPrev ? -1 : hLast > hPrev and lLast > lPrev ? 1 : 0
+
+f_zones(float bPct, int mBase, float lATR) =>
+    var supHi = array.new<float>()
+    var supLo = array.new<float>()
+    var supT  = array.new<int>()
+    var demHi = array.new<float>()
+    var demLo = array.new<float>()
+    var demT  = array.new<int>()
+    var int nNewS = 0
+    var int nNewD = 0
+    a = ta.atr(14)
+    if supHi.size() > 0
+        for i = supHi.size() - 1 to 0
+            if close > supHi.get(i)
+                supHi.remove(i)
+                supLo.remove(i)
+                supT.remove(i)
+            else if supT.get(i) == -1 and high >= supLo.get(i)
+                supT.set(i, bar_index)
+    if demLo.size() > 0
+        for i = demLo.size() - 1 to 0
+            if close < demLo.get(i)
+                demHi.remove(i)
+                demLo.remove(i)
+                demT.remove(i)
+            else if demT.get(i) == -1 and low <= demHi.get(i)
+                demT.set(i, bar_index)
+    if math.abs(close - open) >= lATR * a
+        int k = 0
+        float bh = na
+        float bl = na
+        for i = 1 to mBase
+            r = high[i] - low[i]
+            if r > 0 and math.abs(close[i] - open[i]) <= bPct * r
+                k += 1
+                bh := na(bh) ? high[i] : math.max(bh, high[i])
+                bl := na(bl) ? low[i] : math.min(bl, low[i])
+            else
+                break
+        legIn = k > 0 and math.abs(close[k + 1] - open[k + 1]) > bPct * (high[k + 1] - low[k + 1])
+        if legIn and close < open and close < bl
+            supHi.push(bh)
+            supLo.push(bl)
+            supT.push(-1)
+            nNewS += 1
+        if legIn and close > open and close > bh
+            demHi.push(bh)
+            demLo.push(bl)
+            demT.push(-1)
+            nNewD += 1
+    while supHi.size() > 60
+        supHi.shift()
+        supLo.shift()
+        supT.shift()
+    while demLo.size() > 60
+        demHi.shift()
+        demLo.shift()
+        demT.shift()
+    float sL = na
+    float sH = na
+    float dL = na
+    float dH = na
+    float tgtS = na
+    float tgtD = na
+    if supHi.size() > 0
+        for i = 0 to supHi.size() - 1
+            lo = supLo.get(i)
+            t = supT.get(i)
+            if supHi.get(i) > close and (t == -1 or bar_index - t <= 1) and (na(sL) or lo < sL)
+                sL := lo
+                sH := supHi.get(i)
+            if lo > close and (na(tgtS) or lo < tgtS)
+                tgtS := lo
+    if demLo.size() > 0
+        for i = 0 to demLo.size() - 1
+            hi = demHi.get(i)
+            t = demT.get(i)
+            if demLo.get(i) < close and (t == -1 or bar_index - t <= 1) and (na(dH) or hi > dH)
+                dL := demLo.get(i)
+                dH := hi
+            if hi < close and (na(tgtD) or hi > tgtD)
+                tgtD := hi
+    [sL, sH, dL, dH, tgtS, tgtD, nNewS, nNewD]
+
+stD  = request.security(syminfo.tickerid, "D", f_struct(swD1), lookahead = barmerge.lookahead_off)
+stH4 = request.security(syminfo.tickerid, "240", f_struct(3), lookahead = barmerge.lookahead_off)
+stH1 = request.security(syminfo.tickerid, "60", f_struct(3), lookahead = barmerge.lookahead_off)
+[h4sL, h4sH, h4dL, h4dH, h4tS, h4tD, h4nS, h4nD] = request.security(syminfo.tickerid, "240", f_zones(basePct, maxBase, legATR), lookahead = barmerge.lookahead_off)
+[h1sL, h1sH, h1dL, h1dH, h1tS, h1tD, h1nS, h1nD] = request.security(syminfo.tickerid, "60",  f_zones(basePct, maxBase, legATR), lookahead = barmerge.lookahead_off)
+a15  = request.security(syminfo.tickerid, "15", ta.atr(14), lookahead = barmerge.lookahead_off)
+bias = stD
+
+useH1S = na(h4sL) or (not na(h1sL) and h1sL < h4sL)
+sL = useH1S ? h1sL : h4sL
+sH = useH1S ? h1sH : h4sH
+useH1D = na(h4dH) or (not na(h1dH) and h1dH > h4dH)
+dL = useH1D ? h1dL : h4dL
+dH = useH1D ? h1dH : h4dH
+tgtS = na(h4tS) ? h1tS : na(h1tS) ? h4tS : math.min(h4tS, h1tS)
+tgtD = na(h4tD) ? h1tD : na(h1tD) ? h4tD : math.max(h4tD, h1tD)
+
+hhmm    = hour(time_close, tz) * 100 + minute(time_close, tz)
+mins    = hour(time_close, tz) * 60 + minute(time_close, tz)
+dow     = dayofweek(time_close, tz)
+inBreak = breakFrom <= breakTo ? (hhmm >= breakFrom and hhmm < breakTo) : (hhmm >= breakFrom or hhmm < breakTo)
+var newsArr = str.split(newsTimes, ",")
+bool newsOk = true
+for s in newsArr
+    t = str.tonumber(str.trim(s))
+    if not na(t)
+        d = math.abs(mins - (math.floor(t / 100) * 60 + t % 100))
+        if math.min(d, 1440 - d) <= newsMin
+            newsOk := false
+timeOk = not inBreak and newsOk and dow != dayofweek.saturday and dow != dayofweek.sunday and not (dow == dayofweek.friday and hhmm >= fridayCut)
+
+slS   = sH + slBufATR * a15
+slB   = dL - slBufATR * a15
+distS = slS - sL
+distB = dH - slB
+tpS   = tgtD + tpOff
+tpB   = tgtS - tpOff
+rrS   = na(tpS) or tpS >= sL or distS <= 0 ? 0.0 : (sL - tpS) / distS
+rrB   = na(tpB) or tpB <= dH or distB <= 0 ? 0.0 : (tpB - dH) / distB
+
+var entryTimes = array.new<int>()
+if strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+    entryTimes.push(time_close)
+n24 = 0
+if entryTimes.size() > 0
+    for i = 0 to entryTimes.size() - 1
+        if time_close - entryTimes.get(i) < 86400000
+            n24 += 1
+flat = strategy.position_size == 0
+
+// side the bias allows, and that side's zone numbers
+zLo   = bias == -1 ? sL : bias == 1 ? dL : na
+zHi   = bias == -1 ? sH : bias == 1 ? dH : na
+zTF   = bias == -1 ? (useH1S ? "H1" : "H4") : (useH1D ? "H1" : "H4")
+zDist = bias == -1 ? distS : distB
+zRR   = bias == -1 ? rrS : rrB
+priceOk = bias == -1 ? (not na(sL) and close < sL) : bias == 1 ? (not na(dH) and close > dH) : false
+stopOk  = zDist <= maxATR * a15
+rrOk    = zRR >= minRR
+
+sellSig = timeOk and flat and n24 < maxPer24h and bias == -1 and priceOk and stopOk and rrOk
+buySig  = timeOk and flat and n24 < maxPer24h and bias == 1 and priceOk and stopOk and rrOk
+
+// ---------- orders (unchanged rules) ----------
+var float scMid = na
+var float scTP1 = na
+var float scTP2 = na
+var float scSL  = na
+var float scE1  = na
+var int   scDir = 0
+var bool  scTP1Done = false
+var string scInfo = ""
+if flat
+    if sellSig or buySig
+        dir = sellSig ? -1 : 1
+        e1  = dir == -1 ? sL : dH
+        mid = dir == -1 ? (sL + sH) / 2 : (dL + dH) / 2
+        sl  = dir == -1 ? slS : slB
+        tp1 = e1 + dir * tp1R * math.abs(sl - e1)
+        tp2 = dir == -1 ? math.min(tpS, tp1) : math.max(tpB, tp1)
+        r   = strategy.equity * riskPct / 100 / 3
+        q1  = math.floor(r / math.abs(sl - e1) * 100) / 100
+        q2  = math.floor(r / math.abs(sl - mid) * 100) / 100
+        side = dir == -1 ? strategy.short : strategy.long
+        strategy.entry("E1", side, qty = q1, limit = e1)
+        strategy.entry("E2", side, qty = q2, limit = mid)
+        strategy.entry("E3", side, qty = q2, limit = mid)
+        strategy.exit("X1", "E1", limit = tp1, stop = sl)
+        strategy.exit("X2", "E2", limit = tp1, stop = sl)
+        strategy.exit("X3", "E3", limit = tp2, stop = sl)
+        scMid := mid, scTP1 := tp1, scTP2 := tp2, scSL := sl, scE1 := e1, scDir := dir, scTP1Done := false
+        scInfo := str.format("{0} zone {1} {2}-{3} (width {4}, {5} ATR) | stop {6} = {7} ATR | RR to next zone {8} | H4={9} H1={10}",
+             dir == -1 ? "SELL" : "BUY", zTF, math.round(zLo, 2), math.round(zHi, 2), math.round(zHi - zLo, 2), math.round((zHi - zLo) / a15, 1),
+             math.round(zDist, 2), math.round(zDist / a15, 1), math.round(zRR, 2), stH4, stH1)
+    else
+        strategy.cancel_all()
+else if not scTP1Done
+    if scDir == -1 ? low <= scTP1 : high >= scTP1
+        strategy.cancel("E2")
+        strategy.cancel("E3")
+        strategy.exit("X3", "E3", limit = scTP2, stop = scMid)
+        scTP1Done := true
+    else
+        avg = strategy.position_avg_price
+        scTP1 := avg + scDir * tp1R * math.abs(scSL - avg)
+        scTP2 := scDir == -1 ? math.min(scTP2, scTP1) : math.max(scTP2, scTP1)
+        strategy.exit("X1", "E1", limit = scTP1, stop = scSL)
+        strategy.exit("X2", "E2", limit = scTP1, stop = scSL)
+        strategy.exit("X3", "E3", limit = scTP2, stop = scSL)
+
+// ---------- diagnostics ----------
+// (1) filter funnel, counted on M15 bars while flat
+var int fTime = 0
+var int fBias = 0
+var int fZone = 0
+var int fPrice = 0
+var int fStop = 0
+var int fRR = 0
+var int f24 = 0
+var int fBusy = 0
+if timeOk
+    fTime += 1
+    if not flat
+        fBusy += 1
+    else if bias != 0
+        fBias += 1
+        if not na(zLo)
+            fZone += 1
+            if priceOk
+                fPrice += 1
+                if stopOk
+                    fStop += 1
+                    if rrOk
+                        fRR += 1
+                        if n24 < maxPer24h
+                            f24 += 1
+
+// (2) every new candidate zone on the allowed side, with its verdict
+zKey = math.round(nz(zLo) * 100)
+if bias != 0 and not na(zLo) and (zKey != zKey[1] or bias != bias[1])
+    log.info("CANDIDATE {0} zone {1} {2}-{3} width {4} | price {5} | stop {6} ATR {7} | RR {8} {9}",
+         bias == -1 ? "SELL" : "BUY", zTF, math.round(zLo, 2), math.round(zHi, 2), math.round(zHi - zLo, 2),
+         priceOk ? "below/above zone (order can wait)" : "already inside/past zone",
+         math.round(zDist / a15, 1), stopOk ? "ok" : "TOO WIDE", math.round(zRR, 2), rrOk ? "ok" : "TOO LOW")
+
+// (3) per trade: context at entry, excursion while open, outcome at close
+var float mfe = 0.0
+var float mae = 0.0
+var int   barsIn = 0
+var float eqIn = na
+if strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+    mfe := 0.0
+    mae := 0.0
+    barsIn := 0
+    eqIn := strategy.equity
+    log.info("ENTRY {0} | D1={1}", scInfo, bias)
+if strategy.position_size != 0
+    risk = math.abs(scSL - scE1)
+    fav  = scDir == -1 ? (scE1 - low) / risk : (high - scE1) / risk
+    adv  = scDir == -1 ? (high - scE1) / risk : (scE1 - low) / risk
+    mfe := math.max(mfe, fav)
+    mae := math.max(mae, adv)
+    barsIn += 1
+if strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+    log.info("EXIT result {0}% | best move for us {1}R from E1 | worst against {2}R | {3} bars ({4}h) | TP1 reached {5}",
+         math.round((strategy.equity - eqIn) / eqIn * 100, 2), math.round(mfe, 2), math.round(mae, 2), barsIn, math.round(barsIn * 0.25, 1), scTP1Done)
+
+var int firstBar = time
+if barstate.islastconfirmedhistory
+    log.info("FUNNEL from {0}: tradable bars {1} | in a trade {2} | flat+D1 bias {3} | fresh zone on bias side {4} | price outside zone {5} | stop ok {6} | RR ok {7} | 24h limit ok (order resting) {8}",
+         str.format_time(firstBar, "yyyy-MM-dd", tz), fTime, fBusy, fBias, fZone, fPrice, fStop, fRR, f24)
+    log.info("ZONES created: H4 supply {0}, H4 demand {1}, H1 supply {2}, H1 demand {3}", h4nS, h4nD, h1nS, h1nD)
+
+plot(sH, "Supply high", color.new(color.red, 30), style = plot.style_linebr)
+plot(sL, "Supply low",  color.new(color.red, 30), style = plot.style_linebr)
+plot(dH, "Demand high", color.new(color.green, 30), style = plot.style_linebr)
+plot(dL, "Demand low",  color.new(color.green, 30), style = plot.style_linebr)

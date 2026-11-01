@@ -1,0 +1,98 @@
+//@version=6
+// Gold Asian-range breakout with a daily trend filter. Run it on an M15 chart.
+// 1. Asian range = high / low of 07:00-15:00 MYT (Asian session, before London opens).
+// 2. From 15:00 to 22:00 MYT: buy-stop above the range high, sell-stop below the range low (first one filled cancels the other).
+//    Trend filter: only the side that agrees with price vs the D1 EMA (yesterday's value).
+// 3. Stop at the middle of the range, target = rr x risk. One trade per day. Anything still open closes at 04:00 MYT.
+// Costs: $0.15 per ounce per side (~$0.30 round trip, a typical gold spread). margin = 0: buying power is not checked.
+strategy("Gold Asian breakout", overlay = true, initial_capital = 10000, pyramiding = 0,
+     default_qty_type = strategy.fixed, margin_long = 0, margin_short = 0,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.15)
+
+// ---------- inputs ----------
+riskPct    = input.float(10.0, "Risk per trade %", maxval = 20.0)
+rr         = input.float(2.0, "Target (R)")
+useTrend   = input.bool(true, "Only trade with the D1 trend (EMA)")
+emaLen     = input.int(50, "D1 EMA length")
+bufATR     = input.float(0.1, "Breakout buffer (x ATR M15)")
+minRngATR  = input.float(0.15, "Skip if Asian range < this x D1 ATR")
+maxRngATR  = input.float(1.0, "Skip if Asian range > this x D1 ATR")
+rangeStart = input.int(700, "Asian range from HHMM (MYT)")
+rangeEnd   = input.int(1500, "Asian range until HHMM (MYT)")
+entryEnd   = input.int(2200, "No new entries after HHMM (MYT)")
+dayClose   = input.int(400, "Close everything at HHMM (MYT)")
+newsTimes  = input.string("2030,2200,0200", "News times HHMM MYT (US summer; winter: 2130,2300,0300)")
+newsMin    = input.int(30, "No orders +/- minutes around news times")
+tz = "Asia/Kuala_Lumpur"
+
+// ---------- daily context: yesterday's EMA and ATR (no future data) ----------
+d1ema = request.security(syminfo.tickerid, "D", ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_on)
+d1atr = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+a15   = ta.atr(14)
+
+// ---------- clock (bar open time, MYT) ----------
+hm   = hour(time, tz) * 100 + minute(time, tz)
+mins = hour(time, tz) * 60 + minute(time, tz)
+dow  = dayofweek(time, tz)
+weekday  = dow != dayofweek.saturday and dow != dayofweek.sunday
+inRange  = hm >= rangeStart and hm < rangeEnd
+inWindow = hm >= rangeEnd and hm < entryEnd
+dayEnd   = hm >= dayClose and hm < rangeStart
+var newsArr = str.split(newsTimes, ",")
+bool newsOk = true
+for s in newsArr
+    t = str.tonumber(str.trim(s))
+    if not na(t)
+        d = math.abs(mins - (math.floor(t / 100) * 60 + t % 100))
+        if math.min(d, 1440 - d) <= newsMin
+            newsOk := false
+
+// ---------- Asian range ----------
+var float aHi = na
+var float aLo = na
+var bool  traded = false
+var bool  placed = false
+if inRange and not inRange[1]
+    aHi := high
+    aLo := low
+    traded := false
+    placed := false
+else if inRange
+    aHi := math.max(aHi, high)
+    aLo := math.min(aLo, low)
+
+flat = strategy.position_size == 0
+if strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+    traded := true
+rng      = aHi - aLo
+rangeOk  = not na(rng) and rng >= minRngATR * d1atr and rng <= maxRngATR * d1atr
+allowL   = not useTrend or close > d1ema
+allowS   = not useTrend or close < d1ema
+
+// ---------- orders ----------
+if dayEnd and not flat
+    strategy.close_all(comment = "day close")
+if flat and (not inWindow or not newsOk or not weekday) and placed
+    strategy.cancel_all()          // window over or news: pull pending orders (re-placed after news)
+    placed := false
+if flat and inWindow and newsOk and weekday and not traded and not placed and rangeOk
+    mid = (aHi + aLo) / 2
+    buf = bufATR * a15
+    eL  = aHi + buf
+    eS  = aLo - buf
+    risk = strategy.equity * riskPct / 100
+    if allowL and close < eL
+        qL = math.floor(risk / (eL - mid) * 100) / 100
+        strategy.entry("Long", strategy.long, qty = qL, stop = eL, oca_name = "brk", oca_type = strategy.oca.cancel)
+        strategy.exit("XL", "Long", stop = mid, limit = eL + rr * (eL - mid))
+    if allowS and close > eS
+        qS = math.floor(risk / (mid - eS) * 100) / 100
+        strategy.entry("Short", strategy.short, qty = qS, stop = eS, oca_name = "brk", oca_type = strategy.oca.cancel)
+        strategy.exit("XS", "Short", stop = mid, limit = eS - rr * (mid - eS))
+    placed := true
+
+// ---------- visuals ----------
+plot(inRange or inWindow ? aHi : na, "Asian high", color.new(color.teal, 0), style = plot.style_linebr)
+plot(inRange or inWindow ? aLo : na, "Asian low",  color.new(color.red, 0), style = plot.style_linebr)
+plot(d1ema, "D1 EMA", color.new(color.gray, 40))
+bgcolor(inRange ? color.new(color.blue, 93) : na, title = "Asian range")

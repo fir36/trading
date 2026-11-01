@@ -1,0 +1,5 @@
+mcp>=2.3
+MetaTrader5
+pandas
+numpy
+pyyaml

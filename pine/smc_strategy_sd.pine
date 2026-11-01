@@ -1,0 +1,437 @@
+//@version=6
+// v4: supply/demand zones marked the ForexBee way. Run it on an M1 chart.
+// Zone = highest high / lowest low of 1-3 small-body base candles, between a leg-in and a strong leg-out (RBD/DBD = supply, DBR/RBR = demand).
+// Fresh H4/H1 zones only. D1 structure sets the direction. Entry: M1 confirmation or a limit order at the zone edge (input).
+strategy("SMC gold v4 (base zones)", overlay = true, initial_capital = 10000, pyramiding = 3,
+     process_orders_on_close = true, default_qty_type = strategy.fixed,
+     margin_long = 1, margin_short = 1, max_bars_back = 500)  // 1% margin = 100:1 leverage, like a gold CFD account
+
+// ---------- inputs ----------
+entryMode = input.string("Scale-in x3", "Entry mode", options = ["Confirmation", "Limit order", "Scale-in x3"])
+exitMode  = input.string("Partial + break-even", "Exit mode", options = ["Partial + break-even", "Partial, no break-even", "Full to TP", "Fixed R target"])
+fixR      = input.float(2.0, "Fixed R target (exit mode Fixed R target)")
+tp1R      = input.float(1.5, "Scale-in: TP1 at this R from the average entry")
+lookbackH = input.int(0, "Trade only the last N hours (0 = all history)")
+swD1      = input.int(3, "Swing D1 (bias)")
+basePct   = input.float(0.5, "Base candle: body at most this x its range")
+maxBase   = input.int(3, "Max base candles")
+legATR    = input.float(1.0, "Leg-out candle: body at least this x ATR")
+touchBars = input.int(12, "Touch lookback (bars: 12 = 3h on M15, 180 = 3h on M1)")
+maxAge    = input.int(2, "Signal max age (M1 bars)")
+nearATR   = input.float(0.0, "Signal may form this far from the zone (ATR M15, 0 = must reach it)")
+swLtf     = input.int(2, "Swing M1 (CHoCH)")
+pinRatio  = input.float(2.0, "Pin bar: wick at least N x body")
+slBufATR  = input.float(0.5, "SL buffer beyond zone (ATR M15)")
+tpOff     = input.float(1.0, "TP offset before next zone (price, 1.0 = 10 pips)")
+maxATR    = input.float(4.0, "SL max (ATR M15), wider = skip")
+minRR     = input.float(1.5, "Min reward:risk")
+riskPct   = input.float(5.0, "Risk per trade %", maxval = 5.0)
+maxPer24h = input.int(2, "Max entries per rolling 24h")
+breakFrom = input.int(500, "No trading from HHMM (MYT, daily break)")
+breakTo   = input.int(700, "No trading until HHMM (MYT)")
+fridayCut = input.int(2200, "Friday cutoff HHMM (MYT)")
+newsTimes = input.string("2030,2200,0200", "News times HHMM MYT (US summer time; winter: 2130,2300,0300)")
+newsMin   = input.int(30, "No trading +/- minutes around news times")
+tz = "Asia/Kuala_Lumpur"
+
+// ---------- D1 structure (bias) ----------
+f_struct(int n) =>
+    var float hPrev = na
+    var float hLast = na
+    var float lPrev = na
+    var float lLast = na
+    ph = ta.pivothigh(high, n, n)
+    pl = ta.pivotlow(low, n, n)
+    if not na(ph)
+        hPrev := hLast
+        hLast := ph
+    if not na(pl)
+        lPrev := lLast
+        lLast := pl
+    hLast < hPrev and lLast < lPrev ? -1 : hLast > hPrev and lLast > lPrev ? 1 : 0
+
+// ---------- base zones (runs inside request.security on H4 / H1) ----------
+// Returns the nearest fresh supply above / demand below close, and the nearest unbroken opposite zone edges for targets.
+// Fresh = never touched, or touched on this bar or the bar before (so M1 has time to confirm during the first visit).
+f_zones(float bPct, int mBase, float lATR) =>
+    var supHi = array.new<float>()
+    var supLo = array.new<float>()
+    var supT  = array.new<int>()    // bar_index of first touch, -1 = untouched
+    var demHi = array.new<float>()
+    var demLo = array.new<float>()
+    var demT  = array.new<int>()
+    a = ta.atr(14)
+    // existing zones: a close beyond the far edge breaks it; record the first touch
+    if supHi.size() > 0
+        for i = supHi.size() - 1 to 0
+            if close > supHi.get(i)
+                supHi.remove(i)
+                supLo.remove(i)
+                supT.remove(i)
+            else if supT.get(i) == -1 and high >= supLo.get(i)
+                supT.set(i, bar_index)
+    if demLo.size() > 0
+        for i = demLo.size() - 1 to 0
+            if close < demLo.get(i)
+                demHi.remove(i)
+                demLo.remove(i)
+                demT.remove(i)
+            else if demT.get(i) == -1 and low <= demHi.get(i)
+                demT.set(i, bar_index)
+    // new zone: this bar is a strong leg-out, the 1..mBase bars before it are small-body base candles
+    if math.abs(close - open) >= lATR * a
+        int k = 0
+        float bh = na
+        float bl = na
+        for i = 1 to mBase
+            r = high[i] - low[i]
+            if r > 0 and math.abs(close[i] - open[i]) <= bPct * r
+                k += 1
+                bh := na(bh) ? high[i] : math.max(bh, high[i])
+                bl := na(bl) ? low[i] : math.min(bl, low[i])
+            else
+                break
+        // leg-in: the candle before the base is not itself a base candle
+        legIn = k > 0 and math.abs(close[k + 1] - open[k + 1]) > bPct * (high[k + 1] - low[k + 1])
+        if legIn and close < open and close < bl      // dropped out of the base -> supply (RBD / DBD)
+            supHi.push(bh)
+            supLo.push(bl)
+            supT.push(-1)
+        if legIn and close > open and close > bh      // rallied out of the base -> demand (DBR / RBR)
+            demHi.push(bh)
+            demLo.push(bl)
+            demT.push(-1)
+    while supHi.size() > 60
+        supHi.shift()
+        supLo.shift()
+        supT.shift()
+    while demLo.size() > 60
+        demHi.shift()
+        demLo.shift()
+        demT.shift()
+    float sL = na
+    float sH = na
+    float dL = na
+    float dH = na
+    float tgtS = na
+    float tgtD = na
+    if supHi.size() > 0
+        for i = 0 to supHi.size() - 1
+            lo = supLo.get(i)
+            t = supT.get(i)
+            if supHi.get(i) > close and (t == -1 or bar_index - t <= 1) and (na(sL) or lo < sL)
+                sL := lo
+                sH := supHi.get(i)
+            if lo > close and (na(tgtS) or lo < tgtS)
+                tgtS := lo
+    if demLo.size() > 0
+        for i = 0 to demLo.size() - 1
+            hi = demHi.get(i)
+            t = demT.get(i)
+            if demLo.get(i) < close and (t == -1 or bar_index - t <= 1) and (na(dH) or hi > dH)
+                dL := demLo.get(i)
+                dH := hi
+            if hi < close and (na(tgtD) or hi > tgtD)
+                tgtD := hi
+    // second-nearest opposite zone (TP2 for the scale-in runner), at least $1 beyond the first
+    float tgtS2 = na
+    float tgtD2 = na
+    if supHi.size() > 0 and not na(tgtS)
+        for i = 0 to supHi.size() - 1
+            lo = supLo.get(i)
+            if lo > tgtS + 1.0 and (na(tgtS2) or lo < tgtS2)
+                tgtS2 := lo
+    if demLo.size() > 0 and not na(tgtD)
+        for i = 0 to demLo.size() - 1
+            hi = demHi.get(i)
+            if hi < tgtD - 1.0 and (na(tgtD2) or hi > tgtD2)
+                tgtD2 := hi
+    [sL, sH, dL, dH, tgtS, tgtD, tgtS2, tgtD2]
+
+// lookahead_off: values come from the last closed HTF bar (no future data in the backtest)
+stD = request.security(syminfo.tickerid, "D", f_struct(swD1), lookahead = barmerge.lookahead_off)
+[h4sL, h4sH, h4dL, h4dH, h4tS, h4tD, h4tS2, h4tD2] = request.security(syminfo.tickerid, "240", f_zones(basePct, maxBase, legATR), lookahead = barmerge.lookahead_off)
+[h1sL, h1sH, h1dL, h1dH, h1tS, h1tD, h1tS2, h1tD2] = request.security(syminfo.tickerid, "60",  f_zones(basePct, maxBase, legATR), lookahead = barmerge.lookahead_off)
+a15  = request.security(syminfo.tickerid, "15", ta.atr(14), lookahead = barmerge.lookahead_off)
+bias = stD
+
+// nearest fresh zone from H4 / H1, and nearest target edges
+useH1S = na(h4sL) or (not na(h1sL) and h1sL < h4sL)
+sL = useH1S ? h1sL : h4sL
+sH = useH1S ? h1sH : h4sH
+useH1D = na(h4dH) or (not na(h1dH) and h1dH > h4dH)
+dL = useH1D ? h1dL : h4dL
+dH = useH1D ? h1dH : h4dH
+tgtS = na(h4tS) ? h1tS : na(h1tS) ? h4tS : math.min(h4tS, h1tS)
+tgtD = na(h4tD) ? h1tD : na(h1tD) ? h4tD : math.max(h4tD, h1tD)
+// TP2 level: the next opposite zone beyond TP1's zone (from either timeframe), at least $1 further
+f_beyond(float a, float b, float c, float d, float t1, int dir) =>
+    float r = na
+    for v in array.from(a, b, c, d)
+        if not na(v) and not na(t1) and (dir == -1 ? v < t1 - 1.0 : v > t1 + 1.0)
+            r := na(r) ? v : dir == -1 ? math.max(r, v) : math.min(r, v)
+    r
+tgtD2 = f_beyond(h4tD, h4tD2, h1tD, h1tD2, tgtD, -1)
+tgtS2 = f_beyond(h4tS, h4tS2, h1tS, h1tS2, tgtS, 1)
+
+// ---------- rule: time (24h except daily break, weekends, Friday late, news windows) ----------
+hhmm    = hour(time_close, tz) * 100 + minute(time_close, tz)
+mins    = hour(time_close, tz) * 60 + minute(time_close, tz)
+dow     = dayofweek(time_close, tz)
+inBreak = breakFrom <= breakTo ? (hhmm >= breakFrom and hhmm < breakTo) : (hhmm >= breakFrom or hhmm < breakTo)
+var newsArr = str.split(newsTimes, ",")
+bool newsOk = true
+for s in newsArr
+    t = str.tonumber(str.trim(s))
+    if not na(t)
+        d = math.abs(mins - (math.floor(t / 100) * 60 + t % 100))
+        if math.min(d, 1440 - d) <= newsMin
+            newsOk := false
+timeOk = not inBreak and newsOk and dow != dayofweek.saturday and dow != dayofweek.sunday and not (dow == dayofweek.friday and hhmm >= fridayCut)
+inTest = lookbackH == 0 or time_close >= timenow - lookbackH * 3600000
+
+// ---------- M1 price action ----------
+hh      = ta.highest(high, touchBars)
+ll      = ta.lowest(low, touchBars)
+hc      = ta.highest(close, touchBars)
+lc      = ta.lowest(close, touchBars)
+peakIdx = bar_index + ta.highestbars(high, touchBars)
+troIdx  = bar_index + ta.lowestbars(low, touchBars)
+bearEng = close[1] > open[1] and close < open and open >= close[1] and close <= open[1]
+bullEng = close[1] < open[1] and close > open and open <= close[1] and close >= open[1]
+body    = math.max(math.abs(close - open), syminfo.mintick)
+upWick  = high - math.max(open, close)
+dnWick  = math.min(open, close) - low
+bearPin = upWick >= pinRatio * body and upWick >= 2 * dnWick
+bullPin = dnWick >= pinRatio * body and dnWick >= 2 * upWick
+
+var ltfPL  = array.new<float>()
+var ltfPLi = array.new<int>()
+var ltfPH  = array.new<float>()
+var ltfPHi = array.new<int>()
+plL = ta.pivotlow(low, swLtf, swLtf)
+phL = ta.pivothigh(high, swLtf, swLtf)
+if not na(plL)
+    ltfPL.push(plL)
+    ltfPLi.push(bar_index - swLtf)
+if not na(phL)
+    ltfPH.push(phL)
+    ltfPHi.push(bar_index - swLtf)
+while ltfPL.size() > 300
+    ltfPL.shift()
+    ltfPLi.shift()
+while ltfPH.size() > 300
+    ltfPH.shift()
+    ltfPHi.shift()
+
+// engulfing or pin bar reaching the zone (zone edge already widened by nearATR) within the last maxAge bars
+f_paSell(float edge) =>
+    bool ok = false
+    for k = 0 to maxAge - 1
+        if (bearEng[k] and math.max(high[k], high[k + 1]) >= edge) or (bearPin[k] and high[k] >= edge)
+            ok := true
+    ok
+f_paBuy(float edge) =>
+    bool ok = false
+    for k = 0 to maxAge - 1
+        if (bullEng[k] and math.min(low[k], low[k + 1]) <= edge) or (bullPin[k] and low[k] <= edge)
+            ok := true
+    ok
+
+// CHoCH: last M1 swing low before the peak (inside the window); first close below it must be fresh
+f_chochSell() =>
+    float lvl = na
+    winStart = bar_index - touchBars + 1
+    if ltfPL.size() > 0
+        for i = ltfPL.size() - 1 to 0
+            idx = ltfPLi.get(i)
+            if idx < peakIdx and idx >= winStart
+                lvl := ltfPL.get(i)
+                break
+    bool fired = false
+    if not na(lvl) and bar_index > peakIdx
+        int first = -1
+        for j = bar_index - peakIdx - 1 to 0
+            if close[j] < lvl
+                first := j
+                break
+        fired := first >= 0 and first <= maxAge - 1
+    fired
+f_chochBuy() =>
+    float lvl = na
+    winStart = bar_index - touchBars + 1
+    if ltfPH.size() > 0
+        for i = ltfPH.size() - 1 to 0
+            idx = ltfPHi.get(i)
+            if idx < troIdx and idx >= winStart
+                lvl := ltfPH.get(i)
+                break
+    bool fired = false
+    if not na(lvl) and bar_index > troIdx
+        int first = -1
+        for j = bar_index - troIdx - 1 to 0
+            if close[j] > lvl
+                first := j
+                break
+        fired := first >= 0 and first <= maxAge - 1
+    fired
+
+chS  = f_chochSell()
+chB  = f_chochBuy()
+near = nearATR * a15
+
+// ---------- setups (Confirmation: enter at close; Limit order: rest an order at the zone edge) ----------
+scale     = entryMode == "Scale-in x3"
+lim       = entryMode == "Limit order" or scale
+sellTouch = not na(sL) and hh >= sL and hc <= sH
+buyTouch  = not na(dH) and ll <= dH and lc >= dL
+sellConf  = sellTouch and (chS or f_paSell(sL - near))
+buyConf   = buyTouch and (chB or f_paBuy(dH + near))
+entS  = lim ? sL : close
+entB  = lim ? dH : close
+slS   = sH + slBufATR * a15
+slB   = dL - slBufATR * a15
+distS = slS - entS
+distB = entB - slB
+tpS   = tgtD + tpOff
+tpB   = tgtS - tpOff
+rrS   = na(tpS) or tpS >= entS or distS <= 0 ? 0.0 : (entS - tpS) / distS
+rrB   = na(tpB) or tpB <= entB or distB <= 0 ? 0.0 : (tpB - entB) / distB
+
+// ---------- rule: limits (one position, max entries per rolling 24h) ----------
+var entryTimes = array.new<int>()
+if strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+    entryTimes.push(time_close)
+n24 = 0
+if entryTimes.size() > 0
+    for i = 0 to entryTimes.size() - 1
+        if time_close - entryTimes.get(i) < 86400000
+            n24 += 1
+flat = strategy.position_size == 0
+base = inTest and timeOk and flat and n24 < maxPer24h
+
+trigS = lim ? not na(sL) and close < sL : sellConf      // limit: price still below the zone, order waits above
+trigB = lim ? not na(dH) and close > dH : buyConf
+sellSig = base and bias == -1 and trigS and distS <= maxATR * a15 and rrS >= minRR
+buySig  = base and bias == 1  and trigB and distB <= maxATR * a15 and rrB >= minRR
+
+// ---------- orders: SL/TP from the start; exit mode decides partial / break-even / single target ----------
+fullX  = exitMode == "Full to TP" or exitMode == "Fixed R target"
+tgtSel = exitMode == "Fixed R target" ? entS - fixR * distS : tpS
+tgtBuy = exitMode == "Fixed R target" ? entB + fixR * distB : tpB
+var float eP  = na
+var float tpF = na
+var float q0  = na
+var bool  beSet = false
+// scale-in x3: E1 at the zone edge, E2 + E3 at 50% of the zone, 1/3 of the risk each, one stop for all.
+// TP1 = tp1R x risk from the average fill price, closes E1 + E2; E3's stop moves to its entry and it runs to the next opposite zone.
+var float scMid = na
+var float scTP1 = na
+var float scTP2 = na
+var float scSL  = na
+var int   scDir = 0
+var bool  scTP1Done = false
+if scale
+    if flat
+        if sellSig or buySig
+            dir = sellSig ? -1 : 1
+            e1  = dir == -1 ? sL : dH
+            mid = dir == -1 ? (sL + sH) / 2 : (dL + dH) / 2
+            sl  = dir == -1 ? slS : slB
+            tp1 = e1 + dir * tp1R * math.abs(sl - e1)     // from E1 until more entries fill
+            tp2 = dir == -1 ? math.min(tpS, tp1) : math.max(tpB, tp1)
+            r   = strategy.equity * riskPct / 100 / 3
+            q1  = math.floor(r / math.abs(sl - e1) * 100) / 100
+            q2  = math.floor(r / math.abs(sl - mid) * 100) / 100
+            side = dir == -1 ? strategy.short : strategy.long
+            strategy.entry("E1", side, qty = q1, limit = e1)
+            strategy.entry("E2", side, qty = q2, limit = mid)
+            strategy.entry("E3", side, qty = q2, limit = mid)
+            strategy.exit("X1", "E1", limit = tp1, stop = sl)
+            strategy.exit("X2", "E2", limit = tp1, stop = sl)
+            strategy.exit("X3", "E3", limit = tp2, stop = sl)
+            scMid := mid, scTP1 := tp1, scTP2 := tp2, scSL := sl, scDir := dir, scTP1Done := false
+        else
+            strategy.cancel_all()
+    else if not scTP1Done
+        if scDir == -1 ? low <= scTP1 : high >= scTP1
+            // TP1 reached: stop adding, runner E3 (if filled) to break-even
+            strategy.cancel("E2")
+            strategy.cancel("E3")
+            strategy.exit("X3", "E3", limit = scTP2, stop = scMid)
+            scTP1Done := true
+        else
+            // re-aim TP1 at tp1R from the average fill as E2 / E3 fill
+            avg = strategy.position_avg_price
+            scTP1 := avg + scDir * tp1R * math.abs(scSL - avg)
+            scTP2 := scDir == -1 ? math.min(scTP2, scTP1) : math.max(scTP2, scTP1)
+            strategy.exit("X1", "E1", limit = scTP1, stop = scSL)
+            strategy.exit("X2", "E2", limit = scTP1, stop = scSL)
+            strategy.exit("X3", "E3", limit = scTP2, stop = scSL)
+else if sellSig
+    q = math.floor(strategy.equity * riskPct / 100 / distS * 100) / 100
+    if q > 0
+        strategy.entry("Sell", strategy.short, qty = q, limit = lim ? entS : na)
+        if fullX
+            strategy.exit("Sell TP", "Sell", limit = tgtSel, stop = slS)
+        else
+            strategy.exit("Sell TP1", "Sell", qty_percent = 50, limit = entS - distS, stop = slS)
+            strategy.exit("Sell TP", "Sell", limit = tpS, stop = slS)
+        eP := entS, tpF := tgtSel, q0 := q, beSet := false
+else if flat and not scale
+    strategy.cancel("Sell")
+if buySig and not scale
+    q = math.floor(strategy.equity * riskPct / 100 / distB * 100) / 100
+    if q > 0
+        strategy.entry("Buy", strategy.long, qty = q, limit = lim ? entB : na)
+        if fullX
+            strategy.exit("Buy TP", "Buy", limit = tgtBuy, stop = slB)
+        else
+            strategy.exit("Buy TP1", "Buy", qty_percent = 50, limit = entB + distB, stop = slB)
+            strategy.exit("Buy TP", "Buy", limit = tpB, stop = slB)
+        eP := entB, tpF := tgtBuy, q0 := q, beSet := false
+else if flat and not scale
+    strategy.cancel("Buy")
+// after the partial fill, move the remaining stop to entry (0.75: TradingView rounds the filled size, so compare loosely)
+if not scale and exitMode == "Partial + break-even" and not beSet and strategy.position_size != 0 and math.abs(strategy.position_size) < q0 * 0.75
+    if strategy.position_size < 0
+        strategy.exit("Sell TP", "Sell", limit = tpF, stop = eP)
+    else
+        strategy.exit("Buy TP", "Buy", limit = tpF, stop = eP)
+    beSet := true
+
+// ---------- visuals ----------
+plot(sH, "Supply high", color.new(color.red, 30), style = plot.style_linebr)
+plot(sL, "Supply low",  color.new(color.red, 30), style = plot.style_linebr)
+plot(dH, "Demand high", color.new(color.green, 30), style = plot.style_linebr)
+plot(dL, "Demand low",  color.new(color.green, 30), style = plot.style_linebr)
+bgcolor(timeOk and inTest ? color.new(color.blue, 94) : na, title = "Trading hours")
+
+// ---------- diagnostics (Pine Logs) ----------
+var int nSess = 0
+var int nBias = 0
+var int nZone = 0
+var int nTrig = 0
+var int nStop = 0
+var int nRR   = 0
+if inTest and timeOk and flat and n24 < maxPer24h
+    nSess += 1
+    if bias != 0
+        nBias += 1
+        if (bias == -1 and not na(sL)) or (bias == 1 and not na(dH))
+            nZone += 1
+            if bias == -1 ? trigS : trigB
+                nTrig += 1
+                if (bias == -1 ? distS : distB) <= maxATR * a15
+                    nStop += 1
+                    if (bias == -1 ? rrS : rrB) >= minRR
+                        nRR += 1
+if not na(sL) and (na(sL[1]) or sL != sL[1])
+    log.info("supply zone {0} - {1} (target below: {2})", sL, sH, tgtD)
+if not na(dH) and (na(dH[1]) or dH != dH[1])
+    log.info("demand zone {0} - {1} (target above: {2})", dL, dH, tgtS)
+var int firstBar = time
+f_s(int v) => v == 1 ? "bullish" : v == -1 ? "bearish" : "range/unknown"
+if barstate.islastconfirmedhistory
+    log.info("{0} | history from {1} | tradable bars {2} | D1 bias {3} | fresh zone ahead {4} | {5} {6} | stop<=maxATR {7} | RR>=min {8} | now D1={9}",
+         entryMode, str.format_time(firstBar, "yyyy-MM-dd", tz), nSess, nBias, nZone, lim ? "price below/above zone" : "touch + signal", nTrig, nStop, nRR, f_s(stD))
