@@ -1,13 +1,13 @@
-# SMC v6 trading strategy + WhatsApp alerts
+# SMC v6 trading strategy + Telegram / WhatsApp alerts
 
 Supply/demand zone strategy (D1 trend, H4 filter, fresh H4/H1 zones, 3 limit orders, TP1 at 1.5R + runner to
-the next zone), backtested in TradingView, plus a bot that sends WhatsApp alerts so the trades can be placed
-by hand in MT5 (e.g. on Android). The bot never connects to a broker account.
+the next zone), backtested in TradingView, plus a bot that sends Telegram (and optionally WhatsApp) alerts so
+the trades can be placed by hand in MT5 (e.g. on Android). The bot never connects to a broker account.
 
 | Folder | What |
 |---|---|
 | `pine/smc_sd_v6.pine` | The strategy (TradingView Pine v6). Other `.pine` files are earlier versions and experiments. |
-| `alerts/` | Alert bot: `strategy.py` = v6 rules in Python, `run.py` = data, WhatsApp, state. |
+| `alerts/` | Alert bot: `strategy.py` = v6 rules in Python, `run.py` = data, messaging, state. |
 | `.github/workflows/alerts.yml` | Runs the bot every 15 minutes on GitHub Actions. |
 | `mt5-mcp/` | MCP server + Python backtest for MT5 (needs MT5 on Windows). |
 
@@ -15,17 +15,21 @@ Markets: XAUUSD, USOIL (WTI), EURUSD, USDJPY.
 
 ## Setup (from a phone or any browser)
 
-1. **WhatsApp key (CallMeBot):** save CallMeBot's number in your contacts and send it the activation message,
-   as described on callmebot.com (free WhatsApp API). It replies with your API key.
-2. **Secrets:** repo **Settings > Secrets and variables > Actions > Secrets**, add
-   - `WA_PHONE` = your WhatsApp number in international format, e.g. `+60XXXXXXXXXX`
-   - `WA_APIKEY` = the CallMeBot key
-3. **Variables** (same page, *Variables* tab, optional): `ACCOUNT_BALANCE` (default 100), `RISK_PCT` (default 20).
+1. **Telegram bot:** in Telegram open **@BotFather**, send `/newbot`, pick a name and a username ending in `bot`.
+   BotFather replies with a **token** (looks like `123456789:AAH...`). Open your new bot and press **Start**
+   (a bot can only message you after you have messaged it once).
+2. **Your chat id:** open **@userinfobot**, press Start; it replies with your numeric **Id**.
+3. **Secrets:** repo **Settings > Secrets and variables > Actions > Secrets**, add
+   - `TG_TOKEN` = the BotFather token
+   - `TG_CHAT_ID` = your Id
+   - optional WhatsApp via CallMeBot (when its free bot accepts new users): `WA_PHONE` (`+60...`) and `WA_APIKEY`
+4. **Variables** (same page, *Variables* tab, optional): `ACCOUNT_BALANCE` (default 100), `RISK_PCT` (default 20).
    Update the balance from time to time so lot sizes stay right.
-4. **Actions** tab > *smc-alerts* > **Run workflow**: you should get a "Daily check" WhatsApp within a minute or two.
+5. **Actions** tab > *smc-alerts* > **Run workflow**: you should get a "Daily check" message within a minute or two.
    After that it runs every 15 minutes (Sun 22:00 - Fri 22:00 UTC) and sends a daily check after 07:00 MYT.
 
-Never put the phone number or key in a file: this repo is public; secrets are hidden.
+Never put the token, chat id or phone number in a file: this repo is public; secrets are hidden.
+Anyone with the token can send messages as your bot: if it leaks, revoke it in @BotFather (`/revoke`).
 
 ## Alerts
 

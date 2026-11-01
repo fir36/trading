@@ -1,8 +1,8 @@
-"""WhatsApp alert bot for the SMC v6 strategy. Runs every 15 minutes in GitHub Actions.
+"""Telegram / WhatsApp alert bot for the SMC v6 strategy. Runs every 15 minutes in GitHub Actions.
 
-Each run: download candles from Yahoo -> replay v6 per market -> send WhatsApp (CallMeBot) for
+Each run: download candles from Yahoo -> replay v6 per market -> send Telegram and/or WhatsApp (CallMeBot) for
 events from the last WINDOW minutes that were not sent yet -> save sent event ids in state.json.
-  python alerts/run.py            normal run (prints instead of sending if WA_PHONE/WA_APIKEY are not set)
+  python alerts/run.py            normal run (prints instead of sending if no Telegram/WhatsApp secrets are set)
   python alerts/run.py --replay   backtest the last ~60 days and print the trades (sends nothing)
 """
 import json
@@ -57,18 +57,26 @@ def lots(mk, st, price, balance, risk_pct):
     return out
 
 
-def send_whatsapp(text):
+def send(text):
+    """Send to Telegram and/or WhatsApp, whichever secrets are set; print if none.
+    Never print request URLs or errors with them: they contain the bot token / phone number."""
+    token, chat = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT_ID")
     phone, key = os.environ.get("WA_PHONE"), os.environ.get("WA_APIKEY")
-    if not phone or not key:
-        print("--- (no WA_PHONE/WA_APIKEY: not sent) ---\n" + text)
+    if not (token and chat) and not (phone and key):
+        print("--- (no TG_TOKEN/TG_CHAT_ID or WA_PHONE/WA_APIKEY: not sent) ---\n" + text)
         return
     for part in [text[i:i + 1500] for i in range(0, len(text), 1500)]:
         try:
-            r = requests.get("https://api.callmebot.com/whatsapp.php",
-                             params=dict(phone=phone, text=part, apikey=key), timeout=30)
-            print("WhatsApp status", r.status_code)  # never print the URL: it holds the phone number and key
+            if token and chat:
+                r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                  json=dict(chat_id=chat, text=part), timeout=30)
+                print("Telegram status", r.status_code)
+            if phone and key:
+                r = requests.get("https://api.callmebot.com/whatsapp.php",
+                                 params=dict(phone=phone, text=part, apikey=key), timeout=30)
+                print("WhatsApp status", r.status_code)
         except requests.RequestException as e:
-            print("WhatsApp send failed:", type(e).__name__)
+            print("send failed:", type(e).__name__)
         time.sleep(3)
 
 
@@ -124,7 +132,7 @@ def main():
         msgs.append("Daily check (bot is running)\n" + "\n".join(status) + f"\nBalance setting ${balance:.0f}, risk {risk_pct:.0f}%")
         state["daily"] = today
     if msgs:
-        send_whatsapp("\n\n".join(msgs))
+        send("\n\n".join(msgs))
     state["sent"] = sorted(sent)[-500:]
     STATE.write_text(json.dumps(state, indent=1) + "\n")
 
