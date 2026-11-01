@@ -45,4 +45,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add alerts/state.json
-          git diff --cached --quiet || { git commit -m "alerts: update state" && git push; }
+          git diff --cached --quiet && exit 0
+          git commit -m "alerts: update state"
+          # the repo may have changed during the run: put this commit on top of the latest one
+          # (-X theirs = on a state.json clash keep this run's copy, the newest record) and retry
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin main && git push && exit 0
+            sleep 5
+          done
+          echo "::warning::could not save state.json; the next run may repeat a recent alert"
