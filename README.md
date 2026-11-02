@@ -11,6 +11,10 @@ the trades can be placed by hand in MT5 (e.g. on Android). The bot never connect
 | `.github/workflows/alerts.yml` | Runs the bot every 15 minutes on GitHub Actions. |
 | `mt5-mcp/` | MCP server + Python backtest for MT5 (needs MT5 on Windows). |
 
+`alerts/strategy_v7.py` is an experiment, **not used by the bot**: v6 zones confirmed by chart-pattern levels
+(double tops/bottoms, triangle sides, necklines). Over ~2.5 years it helped on gold and EURUSD (+19.1R vs +17.7R)
+but lost on the 9 other markets it was never tuned on (-1.1R vs +21.2R for v6), so the gain was most likely luck.
+
 Markets: XAUUSD, EURUSD, USDJPY. WTI (USOIL) is switched off in `alerts/run.py` after a losing replay.
 
 ## Setup (from a phone or any browser)
@@ -40,7 +44,6 @@ Anyone with the token can send messages as your bot: if it leaks, revoke it in @
 | setup cancelled | Delete the pending orders |
 | order 2 + 3 filled. Change TP of orders 1+2 to X | Edit the TP of orders 1 and 2 |
 | TP1 hit: move order 3 SL to X | Edit order 3's SL (break-even) |
-| 12h without TP1: CLOSE ALL | Close the open orders, delete pending ones |
 | TP2 / break-even / stop loss | Nothing (MT5 closed it), just information |
 
 ## Limits - read before trading real money
@@ -48,8 +51,10 @@ Anyone with the token can send messages as your bot: if it leaks, revoke it in @
 - **Data:** free Yahoo prices, not your broker's. Gold is a **futures** price: usually a few
   dollars above spot, so shift every level by (your MT5 price - "data price at setup"). Forex is close.
 - **Timing:** GitHub's schedule can start runs several minutes late (sometimes more), so alerts are not instant.
-- **Same rules as the backtest, two changes for manual trading:** levels are frozen when a setup is found
-  (with a steadier 24h ATR for the SL buffer) and pending orders are not removed around news.
+- **Same rules as the backtest, three changes for manual trading:** levels are frozen when a setup is found
+  (with a steadier 24h ATR for the SL buffer), pending orders are not removed around news, and the 12h time
+  stop is off (it made almost no difference over 2.5 years and needs you to act at a set time).
+  The runner has no time limit: swap fees for holding overnight are not in the backtest.
 - **Alert volume:** about 4-7 alerts per market per week in the last 2 months, many of them "setup moved", some at night.
 - **Replay on Yahoo data (Aug 31 - Oct 31 2026, gold + EURUSD + USDJPY):** 13 trades, +12.8R; at 20% risk
   $100 -> $693 with a **35% worst drop** (10% risk: $300, 18% drop). WTI lost -1.2R over 4 trades, so it is off.

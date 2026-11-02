@@ -14,9 +14,11 @@ import numpy as np
 import pandas as pd
 
 # v6 inputs (same values as the Pine script; the max-entries-per-24h limit is off, as chosen after the B/C test)
-P = dict(tp1R=1.5, minRR=2.0, timeStopH=12, swD1=3, basePct=0.5, maxBase=3, legATR=1.0,
+P = dict(tp1R=1.5, minRR=2.0, timeStopH=0,  # 12h time stop removed (made no difference, awkward by hand)
+         swD1=3, basePct=0.5, maxBase=3, legATR=1.0,
          slBufATR=0.5, maxSprPct=10.0, maxATR=4.0, breakFrom=500, breakTo=700, fridayCut=2200,
-         newsTimes=(2030, 2200, 200), newsMin=30)
+         newsTimes=(2030, 2200, 200), newsMin=30,
+         lockHalf=False)  # True: once the runner is half way from its entry to TP2, its SL moves to the TP1 price
 MYT = "Asia/Kuala_Lumpur"
 M15 = pd.Timedelta(minutes=15)
 
@@ -52,15 +54,14 @@ def structure(df, n):
     return out
 
 
-def zones(df, bPct, mBase, lATR):
-    """Pine f_zones on one timeframe. Per candle: the 3 nearest fresh supply zones above and demand
-    zones below the close as (lo, hi), plus the nearest opposite zone edges (targets).
-    Internally a zone is [hi, lo, candle_of_first_touch or -1]."""
-    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
-    a = atr(df)
-    sup, dem, rows = [], [], []
+def track(df, detect):
+    """Zone life cycle shared by every zone type. detect(b) returns the zones born at candle b as
+    [("sup" | "dem", hi, lo)]. A zone dies when a candle closes through it and stays fresh until one candle
+    after its first touch. Per candle: the 3 nearest fresh supply zones above and demand zones below the
+    close as (lo, hi), plus the nearest opposite zone edges (targets)."""
+    h, l, c = (df[k].to_numpy() for k in ("high", "low", "close"))
+    sup, dem, rows = [], [], []  # zone = [hi, lo, candle_of_first_touch or -1]
     for b in range(len(c)):
-        # drop broken zones, remember the first touch
         sup = [z for z in sup if not c[b] > z[0]]
         for z in sup:
             if z[2] == -1 and h[b] >= z[1]:
@@ -69,26 +70,8 @@ def zones(df, bPct, mBase, lATR):
         for z in dem:
             if z[2] == -1 and l[b] <= z[0]:
                 z[2] = b
-        # new zone: 1-3 small-body base candles, then a strong leg-out candle
-        if not math.isnan(a[b]) and abs(c[b] - o[b]) >= lATR * a[b]:
-            k, bh, bl = 0, math.nan, math.nan
-            for i in range(1, mBase + 1):
-                j = b - i
-                if j < 0:
-                    break
-                r = h[j] - l[j]
-                if r > 0 and abs(c[j] - o[j]) <= bPct * r:
-                    k += 1
-                    bh = h[j] if math.isnan(bh) else max(bh, h[j])
-                    bl = l[j] if math.isnan(bl) else min(bl, l[j])
-                else:
-                    break
-            j = b - k - 1
-            leg_in = k > 0 and j >= 0 and abs(c[j] - o[j]) > bPct * (h[j] - l[j])
-            if leg_in and c[b] < o[b] and c[b] < bl:
-                sup.append([bh, bl, -1])
-            if leg_in and c[b] > o[b] and c[b] > bh:
-                dem.append([bh, bl, -1])
+        for side, hi, lo in detect(b):
+            (sup if side == "sup" else dem).append([hi, lo, -1])
         sup, dem = sup[-60:], dem[-60:]
         fresh = lambda z: z[2] == -1 or b - z[2] <= 1
         s, floor = [], -1e10
@@ -115,6 +98,37 @@ def zones(df, bPct, mBase, lATR):
         tgtD = max((z[0] for z in dem if z[0] < c[b]), default=math.nan)
         rows.append((s, d, tgtS, tgtD))
     return rows
+
+
+def zones(df, bPct=P["basePct"], mBase=P["maxBase"], lATR=P["legATR"]):
+    """Pine f_zones (v6 base zones): 1-3 small-body base candles, then a strong leg-out candle."""
+    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    a = atr(df)
+
+    def detect(b):
+        if math.isnan(a[b]) or abs(c[b] - o[b]) < lATR * a[b]:
+            return []
+        k, bh, bl = 0, math.nan, math.nan
+        for i in range(1, mBase + 1):
+            j = b - i
+            if j < 0:
+                break
+            r = h[j] - l[j]
+            if r > 0 and abs(c[j] - o[j]) <= bPct * r:
+                k += 1
+                bh = h[j] if math.isnan(bh) else max(bh, h[j])
+                bl = l[j] if math.isnan(bl) else min(bl, l[j])
+            else:
+                break
+        j = b - k - 1
+        leg_in = k > 0 and j >= 0 and abs(c[j] - o[j]) > bPct * (h[j] - l[j])
+        out = []
+        if leg_in and c[b] < o[b] and c[b] < bl:
+            out.append(("sup", bh, bl))
+        if leg_in and c[b] > o[b] and c[b] > bh:
+            out.append(("dem", bh, bl))
+        return out
+    return track(df, detect)
 
 
 def resample(df, rule):
@@ -167,26 +181,31 @@ class Setup:
     bars_in: int = 0
     gross: float = 0.0
     max_qty: float = 0.0
+    run_stop: float = None  # runner SL after TP1 (break-even, or TP1 price once locked)
 
     def open_orders(self):
         return [k for k in range(3) if self.filled[k] is not None and not self.closed[k]]
 
 
-def replay(m15, h1, spr, tp_off_fixed=None, digits=5, p=P):
-    """Replay v6 over closed M15 candles (UTC index, open/high/low/close).
-    Returns (events, trades, current setup or None)."""
+def replay(m15, h1, spr, tp_off_fixed=None, digits=5, p=P, entry_zones=(("4h", zones), ("1h", zones))):
+    """Replay the strategy over closed candles (UTC index, open/high/low/close).
+    m15 is the clock: normally M15 candles; H1 candles also work for long tests (ATR(M15) is then estimated as
+    ATR(H1) / 2). entry_zones = (timeframe, zone function) pairs the entries come from (v6: base zones on H4
+    and H1); targets always come from the v6 base zones. Returns (events, trades, current setup or None)."""
     h4, d1 = resample(h1, "4h"), resample(h1, "1D")
-    zH4 = zones(h4, p["basePct"], p["maxBase"], p["legATR"])
-    zH1 = zones(h1, p["basePct"], p["maxBase"], p["legATR"])
+    frames = {"4h": h4, "1h": h1}
+    zbase = [(zones(frames[tf]), tf) for tf in ("4h", "1h")]
+    zentry = [(fn(frames[tf]), tf) for tf, fn in entry_zones]
     sD1, sH4 = structure(d1, p["swD1"]), structure(h4, 3)
-    tclose = m15.index + M15
-    iH4 = align(h4.index, pd.Timedelta(hours=4), tclose)
-    iH1 = align(h1.index, pd.Timedelta(hours=1), tclose)
-    iD1 = align(d1.index, pd.Timedelta(days=1), tclose)
+    step = m15.index.to_series().diff().median()
+    per_hour = pd.Timedelta(hours=1) / step
+    tclose = m15.index + step
+    idx = {tf: align(frames[tf].index, pd.Timedelta(tf), tclose) for tf in frames}
+    iH4, iD1 = idx["4h"], align(d1.index, pd.Timedelta(days=1), tclose)
     # Frozen levels need a steady ATR: in a quiet hour the M15 ATR is tiny and the SL buffer would be too
     # tight once the market wakes up, so use the larger of the current ATR and its 24h average
-    a15 = atr(m15)
-    a15 = np.fmax(a15, pd.Series(a15).rolling(96, min_periods=1).mean().to_numpy())
+    a15 = atr(m15) * math.sqrt(M15 / step)
+    a15 = np.fmax(a15, pd.Series(a15).rolling(int(24 * per_hour), min_periods=1).mean().to_numpy())
     O, H, L, C = (m15[k].to_numpy() for k in ("open", "high", "low", "close"))
     myt = tclose.tz_convert(MYT)
     fmt = lambda x: f"{x:.{digits}f}"
@@ -210,7 +229,7 @@ def replay(m15, h1, spr, tp_off_fixed=None, digits=5, p=P):
                             checks = [("fill", ask(st.px[k], st.dir, True), st.dir == -1)]  # sell limit triggers going up
                         elif k in st.open_orders():
                             tp = st.tp2 if k == 2 else st.tp1
-                            stop = st.px[2] if (k == 2 and st.tp1_done) else st.sl
+                            stop = (st.run_stop or st.px[2]) if (k == 2 and st.tp1_done) else st.sl
                             checks = [("tp", ask(tp, st.dir, False), st.dir == 1),
                                       ("stop", ask(stop, st.dir, False), st.dir == -1)]
                         else:
@@ -244,11 +263,12 @@ def replay(m15, h1, spr, tp_off_fixed=None, digits=5, p=P):
         if st is not None and st.first_fill is not None and not st.open_orders():
             net = st.gross - spr * st.max_qty
             if st.tp1_done and st.filled[2] is not None:
-                how = "TP2" if st.exits[-1] == (2, "tp") else "BE"
+                how = "TP2" if st.exits[-1] == (2, "tp") else "LOCK" if st.run_stop else "BE"
             else:
                 how = "TP1" if any(e[1] == "tp" for e in st.exits) else "SL"
             msg = {"TP1": "TP1 hit, trade finished", "TP2": "runner hit TP2, trade finished",
-                   "BE": "runner stopped at break-even, trade finished", "SL": "STOP LOSS hit, trade finished"}[how]
+                   "BE": "runner stopped at break-even, trade finished",
+                   "LOCK": "runner stopped at the locked TP1 price, trade finished", "SL": "STOP LOSS hit, trade finished"}[how]
             pending = " Delete the pending orders." if how in ("TP1", "SL") and any(f is None for f in st.filled) else ""
             events.append(Event(T, how, f"{msg} {net:+.2f}R.{pending}"))
             trades.append(dict(setup=st.created, entry=st.first_fill, exit=T, dir=st.dir, how=how, R=round(net, 3)))
@@ -256,18 +276,22 @@ def replay(m15, h1, spr, tp_off_fixed=None, digits=5, p=P):
 
         # 2) strategy logic at the candle close
         a = a15[i]
-        if math.isnan(a) or min(iH4[i], iH1[i], iD1[i]) < 0:
+        if math.isnan(a) or min(idx["4h"][i], idx["1h"][i], iD1[i]) < 0:
             continue
         if st is not None and st.open_orders():
             st.bars_in += 1
             if st.tp1_done:
+                half = st.px[2] + (st.tp2 - st.px[2]) / 2
+                if p["lockHalf"] and st.run_stop is None and 2 in st.open_orders() and                         ((H[i] >= half) if st.dir == 1 else (L[i] <= half)):
+                    st.run_stop = st.tp1
+                    events.append(Event(T, "LOCK", f"runner half way to TP2: move order 3 SL to {fmt(st.tp1)} (locks the TP1 profit)."))
                 continue
             if (L[i] <= st.tp1 - spr) if st.dir == -1 else (H[i] >= st.tp1):
                 st.tp1_done, st.rest_cancelled = True, True
                 if 2 in st.open_orders():
                     events.append(Event(T, "TP1", f"TP1 hit: orders 1+2 closed. Move order 3 SL to {fmt(st.px[2])} "
                                                   f"(break-even). Order 3 TP stays {fmt(st.tp2)}."))
-            elif p["timeStopH"] > 0 and st.bars_in >= p["timeStopH"] * 4:
+            elif p["timeStopH"] > 0 and st.bars_in >= p["timeStopH"] * per_hour:
                 for k in st.open_orders():
                     st.closed[k] = True
                     st.gross += st.dir * st.qty[k] * (C[i] - st.filled[k])
@@ -288,21 +312,23 @@ def replay(m15, h1, spr, tp_off_fixed=None, digits=5, p=P):
 
         # flat (maybe with pending orders): nearest zone that passes the checks
         bias, h4s = sD1[iD1[i]], sH4[iH4[i]]
-        sA, dA, tSA, tDA = zH4[iH4[i]]
-        sB, dB, tSB, tDB = zH1[iH1[i]]
-        tgtS = min(x for x in (tSA, tSB, math.inf) if not math.isnan(x))
-        tgtD = max(x for x in (tDA, tDB, -math.inf) if not math.isnan(x))
+        tS = [rows[idx[tf][i]][2] for rows, tf in zbase]
+        tD = [rows[idx[tf][i]][3] for rows, tf in zbase]
+        tgtS = min([x for x in tS if not math.isnan(x)] + [math.inf])
+        tgtD = max([x for x in tD if not math.isnan(x)] + [-math.inf])
+        sups = [z for rows, tf in zentry for z in rows[idx[tf][i]][0]]
+        dems = [z for rows, tf in zentry for z in rows[idx[tf][i]][1]]
         tp_off = max(tp_off_fixed if tp_off_fixed is not None else 0.12 * a, spr)
         buf = max(p["slBufATR"] * a, 2 * spr)
         c, valid = C[i], []
         if bias == -1 and h4s != 1:
-            for lo, hi in sA + sB:
+            for lo, hi in sups:
                 dist = hi + buf - lo
                 rr = (lo - (tgtD + tp_off)) / dist if tgtD > -math.inf else 0.0
                 if c < lo and dist <= p["maxATR"] * a and spr <= p["maxSprPct"] / 100 * dist and rr >= p["minRR"]:
                     valid.append((lo, hi))
         if bias == 1 and h4s != -1:
-            for lo, hi in dA + dB:
+            for lo, hi in dems:
                 dist = hi - (lo - buf)
                 rr = ((tgtS - tp_off) - hi) / dist if tgtS < math.inf else 0.0
                 if c > hi and dist <= p["maxATR"] * a and spr <= p["maxSprPct"] / 100 * dist and rr >= p["minRR"]:
